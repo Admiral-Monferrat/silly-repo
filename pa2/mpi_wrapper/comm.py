@@ -2,7 +2,7 @@ from mpi4py import MPI
 import numpy as np
 
 class Communicator(object):
-    def init(self, comm: MPI.Comm):
+    def __init__(self, comm: MPI.Comm):
         self.comm = comm
         self.total_bytes_transferred = 0
 
@@ -36,61 +36,136 @@ class Communicator(object):
         self.comm.Reduce_scatter_block(src_array, dest_array, op)
 
     def Split(self, key, color):
-        return Communicator(self.comm.Split(key=key, color=color))
+        return __class__(self.comm.Split(key=key, color=color))
 
     def Alltoall(self, src_array, dest_array):
         nprocs = self.comm.Get_size()
-        assert src_array.size % nprocs == 0, "src_array size must be divisible by the number of processes"
-        assert dest_array.size % nprocs == 0, "dest_array size must be divisible by the number of processes"
+
+        # Ensure that the arrays can be evenly partitioned among processes.
+        assert src_array.size % nprocs == 0, (
+            "src_array size must be divisible by the number of processes"
+        )
+        assert dest_array.size % nprocs == 0, (
+            "dest_array size must be divisible by the number of processes"
+        )
+
+        # Calculate the number of bytes in one segment.
         send_seg_bytes = src_array.itemsize * (src_array.size // nprocs)
         recv_seg_bytes = dest_array.itemsize * (dest_array.size // nprocs)
+
+        # Each process sends one segment to every other process (nprocs - 1)
+        # and receives one segment from each.
         self.total_bytes_transferred += send_seg_bytes * (nprocs - 1)
         self.total_bytes_transferred += recv_seg_bytes * (nprocs - 1)
+
         self.comm.Alltoall(src_array, dest_array)
 
     def myAllreduce(self, src_array, dest_array, op=MPI.SUM):
+        """
+        A manual implementation of all-reduce using a reduce-to-root
+        followed by a broadcast.
+        
+        Each non-root process sends its data to process 0, which applies the
+        reduction operator (by default, summation). Then process 0 sends the
+        reduced result back to all processes.
+        
+        The transfer cost is computed as:
+        - For non-root processes: one send and one receive.
+        - For the root process: (n-1) receives and (n-1) sends.
+        """
+        rank = self.comm.Get_rank()
+        size = self.comm.Get_size()
         root = 0
-        nprocs = self.Get_size()
-        rank = self.Get_rank()
-        src_byte = src_array.itemsize * src_array.size
         
+        # Calculate the number of bytes transferred
+        array_bytes = src_array.itemsize * src_array.size
+        
+        # Copy source data to destination array for the root process
         if rank == root:
-            self.comm.Reduce(src_array, dest_array, op=op, root=root)
+            np.copyto(dest_array, src_array)
+            temp_array = np.empty_like(src_array)
+            
+            # Root receives and reduces data from all other processes
+            for i in range(1, size):
+                self.comm.Recv(temp_array, source=i)
+                if op == MPI.SUM:
+                    dest_array += temp_array
+                elif op == MPI.PROD:
+                    dest_array *= temp_array
+                elif op == MPI.MAX:
+                    np.maximum(dest_array, temp_array, dest_array)
+                elif op == MPI.MIN:
+                    np.minimum(dest_array, temp_array, dest_array)
+                
+                # Update bytes transferred (receive from each process)
+                self.total_bytes_transferred += array_bytes
+            
+            # Root broadcasts the result to all other processes
+            for i in range(1, size):
+                self.comm.Send(dest_array, dest=i)
+                
+                # Update bytes transferred (send to each process)
+                self.total_bytes_transferred += array_bytes
         else:
-            self.comm.Reduce(src_array, None, op=op, root=root)
+            # Non-root processes send their data to root
+            self.comm.Send(src_array, dest=root)
+            
+            # Non-root processes receive the result from root
+            self.comm.Recv(dest_array, source=root)
+            
+            # Update bytes transferred (one send and one receive per non-root process)
+            self.total_bytes_transferred += 2 * array_bytes
         
-        self.comm.Bcast(dest_array, root=root)
-        
-        if rank == root:
-            self.total_bytes_transferred += 2 * (nprocs - 1) * src_byte
-        else:
-            self.total_bytes_transferred += 2 * src_byte
-
     def myAlltoall(self, src_array, dest_array):
-        nprocs = self.Get_size()
-        rank = self.Get_rank()
+        """
+        A manual implementation of all-to-all where each process sends a
+        distinct segment of its source array to every other process.
         
-        assert src_array.size % nprocs == 0, "src_array size must be divisible by the number of processes"
-        assert dest_array.size % nprocs == 0, "dest_array size must be divisible by the number of processes"
+        It is assumed that the total length of src_array (and dest_array)
+        is evenly divisible by the number of processes.
         
-        seg_size_src = src_array.size // nprocs
-        send_seg_bytes = src_array.itemsize * seg_size_src
-        seg_size_dest = dest_array.size // nprocs
-        recv_seg_bytes = dest_array.itemsize * seg_size_dest
-        
-        self.total_bytes_transferred += send_seg_bytes * (nprocs - 1)
-        self.total_bytes_transferred += recv_seg_bytes * (nprocs - 1)
-        
-        for k in range(nprocs):
-            src_start = k * seg_size_src
-            src_end = src_start + seg_size_src
-            send_segment = src_array[src_start:src_end]
+        The algorithm loops over the ranks:
+        - For the local segment (when destination == self), a direct copy is done.
+        - For all other segments, the process exchanges the corresponding
+            portion of its src_array with the other process via Sendrecv.
             
-            dest_start = k * seg_size_dest
-            dest_end = dest_start + seg_size_dest
-            recv_segment = dest_array[dest_start:dest_end]
+        The total data transferred is updated for each pairwise exchange.
+        """
+        rank = self.comm.Get_rank()
+        size = self.comm.Get_size()
+        
+        # Ensure arrays can be evenly partitioned
+        assert src_array.size % size == 0, "src_array size must be divisible by the number of processes"
+        assert dest_array.size % size == 0, "dest_array size must be divisible by the number of processes"
+        
+        # Calculate segment size
+        segment_size = src_array.size // size
+        
+        # Calculate bytes per segment
+        segment_bytes = src_array.itemsize * segment_size
+        
+        # Create a temporary buffer for receiving data
+        temp_buffer = np.empty(segment_size, dtype=src_array.dtype)
+        
+        for i in range(size):
+            # Calculate the segment indices for source and destination arrays
+            src_start = i * segment_size
+            src_end = src_start + segment_size
+            dest_start = rank * segment_size
+            dest_end = dest_start + segment_size
             
-            if k == rank:
-                np.copyto(recv_segment, send_segment)
+            if i == rank:
+                # For local segment, just copy the data directly
+                dest_array[src_start:src_end] = src_array[src_start:src_end]
             else:
-                self.comm.Sendrecv(send_segment, dest=k, recvbuf=recv_segment, source=k)
+                # For remote segments, exchange data using Sendrecv
+                self.comm.Sendrecv(
+                    src_array[src_start:src_end], dest=i, 
+                    recvbuf=temp_buffer, source=i
+                )
+                
+                # Copy received data to the appropriate segment of dest_array
+                dest_array[i*segment_size:(i+1)*segment_size] = temp_buffer
+                
+                # Update bytes transferred (each process sends one segment and receives one segment)
+                self.total_bytes_transferred += 2 * segment_bytes
